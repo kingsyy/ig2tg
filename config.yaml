@@ -1,0 +1,12 @@
+telegram:
+  bot_token: "${env:TG_BOT_TOKEN}"
+  supergroup_id: "${env:TG_SUPERGROUP_ID}"
+  owner_id: "${env:TG_OWNER_ID}"
+
+bridge:
+  db_path: "${env:BRIDGE_DB_PATH:-./data/bridge.sqlite}"
+  media_timeout_ms: "${env:BRIDGE_MEDIA_TIMEOUT_MS:-15000}"
+  backfill_on_start: "${env:BRIDGE_BACKFILL_ON_START:-true}"
+  backfill_count: "${env:BRIDGE_BACKFILL_COUNT:-20}"
+  topic_name_format: "${env:BRIDGE_TOPIC_NAME_FORMAT:-@{username}}"
+  log_level: "${env:BRIDGE_LOG_LEVEL:-debug}"

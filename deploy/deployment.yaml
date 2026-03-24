@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ig2tg
+  namespace: ig2tg
+  labels:
+    app: ig2tg
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # single writer for SQLite
+  selector:
+    matchLabels:
+      app: ig2tg
+  template:
+    metadata:
+      labels:
+        app: ig2tg
+    spec:
+      containers:
+        - name: ig2tg
+          image: ig2tg:latest
+          imagePullPolicy: IfNotPresent
+          args: ["/app/config/config.yaml"]
+          env:
+            - name: TG_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ig2tg-secrets
+                  key: TG_BOT_TOKEN
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            exec:
+              command: ["node", "-e", "process.exit(0)"]
+            initialDelaySeconds: 30
+            periodSeconds: 60
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: ig2tg-data
+        - name: config
+          configMap:
+            name: ig2tg-config
