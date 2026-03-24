@@ -31,22 +31,74 @@ ig2tg connects to Instagram's realtime messaging protocol and bridges every DM c
 
 - Node.js ≥ 20
 - A personal Instagram account
-- A Telegram bot token, supergroup with **Topics** enabled, and your user ID — see [docs/setup.md](docs/setup.md) for how to get these
+- A Telegram bot token, supergroup with **Topics** enabled, and your user ID
 
-### Install
+### 1. Create a Telegram bot
+
+1. Message **@BotFather** on Telegram → `/newbot`
+2. Follow the prompts to pick a name and username
+3. Copy the bot token (e.g. `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`)
+4. **Disable privacy mode**: In BotFather → `/mybots` → select your bot → **Bot Settings** → **Group Privacy** → **Turn off**
+
+   Without this, the bot can't read messages in topics, so TG→IG forwarding won't work.
+
+### 2. Create a supergroup with Topics
+
+1. Telegram → **New Group** → add at least one member (required by Telegram to create a group)
+2. Open group settings → **Edit** → enable **Topics**
+3. Add your bot as admin with these permissions:
+   - **Manage Topics** — create/close/reopen topics
+   - **Post Messages** — forward messages into topics
+   - **Delete Messages** — auto-delete `/login` messages containing credentials
+
+### 3. Get your IDs
+
+| Value | How to get it |
+|---|---|
+| `bot_token` | From BotFather (step 1) |
+| `supergroup_id` | Open your group in [web.telegram.org](https://web.telegram.org) — the number after `#` in the URL (e.g. `-1001234567890`) |
+| `owner_id` | Message **@userinfobot** on Telegram — it replies with your user ID |
+
+**Alternative for supergroup_id:** Add **@RawDataBot** to your supergroup — it will print the chat ID (starts with `-100`). Remove it after.
+
+### 4. Configure
+
+Set environment variables:
+
+```bash
+export TG_BOT_TOKEN="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+export TG_SUPERGROUP_ID="-1001234567890"
+export TG_OWNER_ID="123456789"
+```
+
+Or edit `config.yaml` directly with literal values instead of `${env:...}` references.
+
+<details>
+<summary>All config options</summary>
+
+```yaml
+telegram:
+  bot_token: "${env:TG_BOT_TOKEN}"
+  supergroup_id: "${env:TG_SUPERGROUP_ID}"
+  owner_id: "${env:TG_OWNER_ID}"
+
+bridge:
+  db_path: "${env:BRIDGE_DB_PATH:-./data/bridge.sqlite}"
+  media_timeout_ms: "${env:BRIDGE_MEDIA_TIMEOUT_MS:-15000}"
+  backfill_on_start: "${env:BRIDGE_BACKFILL_ON_START:-true}"
+  backfill_count: "${env:BRIDGE_BACKFILL_COUNT:-20}"
+  topic_name_format: "${env:BRIDGE_TOPIC_NAME_FORMAT:-@{username}}"
+  log_level: "${env:BRIDGE_LOG_LEVEL:-debug}"
+```
+
+</details>
+
+### 5. Install and run
 
 ```bash
 git clone https://github.com/GYovchev/ig2tg.git
 cd ig2tg
 npm install
-```
-
-### Run
-
-```bash
-export TG_BOT_TOKEN="123456:ABC..."
-export TG_SUPERGROUP_ID="-1234..."
-export owner_id="123..."
 
 # Development (tsx, no build step)
 npm run dev
@@ -56,9 +108,7 @@ npm run build
 npm start
 ```
 
-Or apply Kubernetes definitions in deploy folder.
-
-### Connect Instagram
+### 6. Connect Instagram
 
 Once the bot is running, open the supergroup's **General** topic and send:
 
@@ -67,6 +117,14 @@ Once the bot is running, open the supergroup's **General** topic and send:
 ```
 
 The message is auto-deleted for security. If 2FA is required, the bot will prompt you to send `/2fa <code>`.
+
+This is a one-time step — the session persists across restarts.
+
+### 7. Test
+
+1. Send a DM to your Instagram account from another account
+2. A new forum topic should appear in your supergroup
+3. Reply in that topic — the message should arrive on Instagram
 
 ## Bot Commands
 
