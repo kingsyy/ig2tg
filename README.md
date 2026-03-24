@@ -16,6 +16,10 @@ Instagram ←→ MQTT ←→ ig2tg ←→ Telegram Bot API
 
 ig2tg connects to Instagram's realtime messaging protocol and bridges every DM conversation into a **Telegram forum topic** inside a single supergroup. When someone messages you on Instagram, a topic is automatically created with their username. When you reply in that topic, your message is sent back to Instagram. You can also keep using the Instagram app — messages you send from your phone sync to Telegram too.
 
+<p align="center">
+  <img src="docs/img/chats.jpeg" alt="Telegram supergroup with auto-created topics per Instagram contact" width="300">
+</p>
+
 ## Features
 
 - **Bidirectional sync** — reply from Telegram or from the Instagram app, both sides stay in sync
