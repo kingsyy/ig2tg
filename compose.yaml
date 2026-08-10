@@ -8,7 +8,8 @@ services:
       context: .
       dockerfile: Dockerfile
       pull: false
-    image: ig2tg:bc2164debbbe5191aa5795ecab02cb9f87633abd
+    # A local-only tag. The checked-out Git commit is the reviewed source version.
+    image: ig2tg:manual-pinned
     container_name: ig2tg
     restart: unless-stopped
     init: true
