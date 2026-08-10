@@ -8,3 +8,5 @@ docs/
 .env
 .gitignore
 .dockerignore
+._*
+.DS_Store

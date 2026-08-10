@@ -5,3 +5,5 @@ data/
 *.sqlite-journal
 *.sqlite-wal
 .env
+._*
+.DS_Store
