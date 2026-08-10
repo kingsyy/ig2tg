@@ -21,6 +21,10 @@ RUN apk add --no-cache ffmpeg
 
 WORKDIR /app
 
+# Keep the Instagram session, internal config, logs, and SQLite database together
+# on the persistent /app/data volume. Without this, Docker recreations lose login state.
+ENV HOME=/app/data
+
 COPY package.json package-lock.json ./
 COPY patches/ patches/
 RUN npm ci --omit=dev

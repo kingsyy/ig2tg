@@ -1,0 +1,26 @@
+# QNAP Container Station deployment
+# Update deliberately: fetch/review a chosen commit, then run:
+#   docker compose build --pull=false && docker compose up -d --force-recreate
+# There is intentionally no Watchtower, `latest` tag, or automatic pull/update policy.
+services:
+  ig2tg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      pull: false
+    image: ig2tg:89b220076d1eece20e43477bfd0d2273329ba61f
+    container_name: ig2tg
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      HOME: /app/data
+      BRIDGE_DB_PATH: /app/data/bridge.sqlite
+      BRIDGE_LOG_LEVEL: info
+    volumes:
+      - ./data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
