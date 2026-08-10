@@ -2,7 +2,7 @@
 
 This deployment is deliberately **not automatically updated**:
 
-- Container Station runs the local image tag `ig2tg:89b220076d1eece20e43477bfd0d2273329ba61f`.
+- Container Station runs the local image tag `ig2tg:bc2164debbbe5191aa5795ecab02cb9f87633abd`.
 - There is no Watchtower, `latest` tag, scheduled pull, or automated Git sync.
 - The app starts only when you manually build and recreate the container.
 
