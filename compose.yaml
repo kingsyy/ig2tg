@@ -11,6 +11,8 @@ services:
     # A local-only tag. The checked-out Git commit is the reviewed source version.
     image: ig2tg:manual-pinned
     container_name: ig2tg
+    # Match the QNAP owner of ./data so SQLite and the Instagram session remain private.
+    user: "1007:100"
     restart: unless-stopped
     init: true
     env_file:
