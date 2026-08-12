@@ -11,6 +11,9 @@
 		"build": "tsc",
 		"start": "node dist/bridge/index.js",
 		"dev": "tsx source/bridge/index.ts",
+		"test": "node --import tsx --test test/*.test.ts",
+		"typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
+		"check": "npm run typecheck && npm test",
 		"postinstall": "patch-package"
 	},
 	"dependencies": {

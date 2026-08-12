@@ -2,10 +2,23 @@ import {Bot, type Context} from 'grammy';
 import type Database from 'better-sqlite3';
 import {InstagramClient} from '../client.js';
 import type {BridgeConfig} from './config.js';
-import {getAllActiveThreads, getAllThreads, getMessageCount, setThreadActive, clearAllData} from './db.js';
+import {
+	getAllActiveThreads,
+	getAllThreads,
+	getMessageCount,
+	setThreadActive,
+	clearAllData,
+	countOutboundByStatus,
+	getFailedOutbound,
+	getOutboundByTgMessageId,
+} from './db.js';
 import {routeTelegramToIG} from './sync.js';
-import {igState, hookIGEvents, backfillRecentThreads} from './index.js';
+import {igState, hookIGEvents, backfillRecentThreads, detachIGEvents} from './index.js';
+import {reconcileRecentMessages} from './reconcile.js';
+import {retryRecord, type ProcessDeps} from './outbound.js';
+import {bridgeHealth, formatWhen} from './health.js';
 import {createLogger} from './logger.js';
+import {describeError} from '../utils/redact.js';
 
 const logger = createLogger('telegram');
 
@@ -23,7 +36,7 @@ export function createBot(
 	const bot = new Bot(config.telegram.bot_token);
 
 	bot.catch((err) => {
-		logger.error('grammY error', err.error);
+		logger.error(`grammY error: ${describeError(err.error)}`);
 	});
 
 	registerCommands(bot, db, config);
@@ -79,8 +92,9 @@ function registerCommands(
 			`/logout — Disconnect Instagram\n\n` +
 			`*Bridge*\n` +
 			`/status — Connection state & stats\n` +
-			`/reconnect — Force-reconnect Instagram\n` +
-			`/sync — Backfill recent threads\n` +
+			`/reconnect — Reconnect Instagram realtime now\n` +
+			`/sync — Check for missed Instagram messages\n` +
+			`/retry — Reply to a failed message to resend it\n` +
 			`/cleanup — Delete all topics and reset DB\n\n` +
 			`*Contacts*\n` +
 			`/contacts — List bridged contacts\n` +
@@ -225,7 +239,14 @@ function registerCommands(
 
 		igState.client = null;
 		pending2FA = null;
-		await ctx.reply('✅ Disconnected from Instagram. Use /login to reconnect.');
+		detachIGEvents();
+
+		const queued = countOutboundByStatus(db);
+		const waiting = queued.pending + queued.sending;
+		await ctx.reply(
+			'✅ Disconnected from Instagram. Use /login to reconnect.' +
+			(waiting > 0 ? `\n\n${waiting} outgoing message(s) stay queued until you log in again.` : ''),
+		);
 		logger.info('Logged out via /logout');
 	});
 
@@ -237,27 +258,105 @@ function registerCommands(
 		const ig = igState.client;
 		const threads = getAllActiveThreads(db);
 		const msgCount = getMessageCount(db);
+		const queue = countOutboundByStatus(db);
+		const reconciliation = bridgeHealth.lastReconciliation;
 
-		await ctx.reply(
-			`🔗 *Bridge Status*\n\n` +
-			`Instagram: \`${ig ? ig.getRealtimeStatus() : 'not connected'}\`\n` +
-			`Active threads: ${threads.length}\n` +
-			`Messages forwarded: ${msgCount}\n` +
+		// Container health and Instagram realtime health are reported separately:
+		// the container can run continuously through an MQTT outage.
+		const realtime = ig ? ig.getRealtimeStatus() : 'not connected';
+		const realtimeDetail =
+			realtime === 'reconnecting' && ig
+				? ` (attempt ${ig.getReconnectAttempt() + 1})`
+				: '';
+
+		const lines = [
+			`🔗 *Bridge Status*`,
+			``,
+			`Application: \`running\``,
+			`Instagram session: \`${ig ? 'authenticated' : 'not connected'}\``,
+			`Instagram realtime: \`${realtime}${realtimeDetail}\``,
+			`Last realtime event: ${formatWhen(ig?.getLastRealtimeEventAt())}`,
+			`Last message check: ${
+				reconciliation
+					? `${formatWhen(reconciliation.at)} (${reconciliation.forwarded} forwarded, ${reconciliation.failures} failed)`
+					: 'never'
+			}`,
+			`Pending outgoing: ${queue.pending + queue.sending}`,
+			`Failed outgoing: ${queue.failed}`,
+			``,
+			`Active threads: ${threads.length}`,
+			`Messages forwarded: ${msgCount}`,
 			`IG user: @${ig?.getUsername() || 'none'}`,
-			{parse_mode: 'Markdown'},
-		);
+		];
+
+		if (queue.failed > 0) {
+			lines.push('', `Reply to a failed message with /retry to resend it.`);
+		}
+
+		await ctx.reply(lines.join('\n'), {parse_mode: 'Markdown'});
 	});
 
 	bot.command('reconnect', async (ctx) => {
 		if (!isAuthorized(ctx, config)) return;
 		if (!requireIG(ctx)) return;
 
-		await ctx.reply('🔄 Reconnecting Instagram MQTT...');
+		await ctx.reply('🔄 Reconnecting Instagram realtime...');
 		try {
-			await igState.client!.shutdown();
-			await ctx.reply('⚠️ MQTT disconnected. Restart the bridge or /login again.');
+			const outcome = await igState.client!.reconnectRealtime();
+			const replies = {
+				connected: '✅ Instagram realtime reconnected.',
+				in_progress: '🔄 A reconnect is already in progress. Check /status in a moment.',
+				failed: '⚠️ Reconnect failed. The bridge will keep retrying in the background.',
+			} as const;
+			await ctx.reply(replies[outcome]);
 		} catch (error) {
-			await ctx.reply(`❌ Reconnect failed: ${(error as Error).message}`);
+			logger.error(`Reconnect command failed: ${describeError(error)}`);
+			await ctx.reply('❌ Reconnect failed. The bridge will keep retrying in the background.');
+		}
+	});
+
+	bot.command('retry', async (ctx) => {
+		if (!isAuthorized(ctx, config)) return;
+		if (!requireIG(ctx)) return;
+
+		const replyTo = ctx.message?.reply_to_message;
+		const chatId = ctx.chat!.id;
+
+		const record = replyTo
+			? getOutboundByTgMessageId(db, chatId, replyTo.message_id)
+			: getFailedOutbound(db, 1)[0];
+
+		if (!record) {
+			await ctx.reply(
+				replyTo
+					? '⚠️ That message is not a queued Instagram send.'
+					: '⚠️ Nothing to retry. Reply to a failed message with /retry.',
+				{message_thread_id: ctx.message?.message_thread_id},
+			);
+			return;
+		}
+
+		const deps: ProcessDeps = {
+			db,
+			ig: igState.client!,
+			api: ctx.api,
+			bot,
+			config,
+		};
+
+		const outcome = await retryRecord(deps, record.id);
+
+		// A successful retry announces itself in the topic; only report the
+		// outcomes that would otherwise be silent.
+		if (outcome === 'not_eligible') {
+			await ctx.reply(`⚠️ That message is already \`${record.status}\`.`, {
+				message_thread_id: ctx.message?.message_thread_id,
+				parse_mode: 'Markdown',
+			});
+		} else if (outcome === 'retrying') {
+			await ctx.reply('🔄 Instagram is not accepting it yet. Kept queued for another attempt.', {
+				message_thread_id: ctx.message?.message_thread_id,
+			});
 		}
 	});
 
@@ -328,16 +427,36 @@ function registerCommands(
 		});
 	});
 
+	/**
+	 * A bounded reconciliation: verify the session, make sure recent threads have
+	 * topics, then forward anything recent that never reached Telegram.
+	 * Reports aggregate counts only — never message contents.
+	 */
 	bot.command('sync', async (ctx) => {
 		if (!isAuthorized(ctx, config)) return;
 		if (!requireIG(ctx)) return;
 
-		await ctx.reply('🔄 Backfilling recent threads...');
+		const ig = igState.client!;
+		await ctx.reply('🔄 Checking Instagram for missed messages...');
+
 		try {
-			await backfillRecentThreads(igState.client!, db, bot, config);
-			await ctx.reply('✅ Backfill complete.');
+			if (!(await ig.checkSession())) {
+				await ctx.reply('❌ Instagram session is not authenticated. Use /login to reconnect.');
+				return;
+			}
+
+			await backfillRecentThreads(ig, db, bot, config);
+			const result = await reconcileRecentMessages(ig, bot, db, config);
+
+			await ctx.reply(
+				`✅ Sync complete\n` +
+				`Threads checked: ${result.threadsChecked}\n` +
+				`Missing messages forwarded: ${result.forwarded}\n` +
+				`Failures: ${result.failures}`,
+			);
 		} catch (error) {
-			await ctx.reply(`❌ Backfill failed: ${(error as Error).message}`);
+			logger.error(`Sync failed: ${describeError(error)}`);
+			await ctx.reply('❌ Sync failed. Check the bridge log for the error class.');
 		}
 	});
 
@@ -394,7 +513,12 @@ function registerMessageHandler(
 	config: BridgeConfig,
 ): void {
 	bot.on('message', async (ctx) => {
-		logger.debug(`Update from chat=${ctx.chat?.id} user=${ctx.from?.id} thread=${ctx.message.message_thread_id ?? 'none'} text=${ctx.message.text?.slice(0, 30) ?? '<media>'}`);
+		// Metadata only. Message text — even a short preview — is never logged.
+		logger.debug(
+			`Update from chat=${ctx.chat?.id} user=${ctx.from?.id} ` +
+			`thread=${ctx.message.message_thread_id ?? 'none'} ` +
+			`content_type=${describeContentType(ctx)}`,
+		);
 
 		if (ctx.message.text?.startsWith('/')) return;
 		if (ctx.chat?.id !== config.telegram.supergroup_id) {
@@ -410,7 +534,18 @@ function registerMessageHandler(
 			return;
 		}
 
-		await routeTelegramToIG(ctx, igState.client, db, config);
+		await routeTelegramToIG(ctx, igState.client, bot, db, config);
 	});
+}
+
+/** Names the payload kind for logs without touching its contents. */
+function describeContentType(ctx: Context): string {
+	const message = ctx.message;
+	if (!message) return 'none';
+	if (message.text) return 'text';
+	if (message.photo) return 'photo';
+	if (message.video) return 'video';
+	if (message.voice) return 'voice';
+	return 'other';
 }
 
