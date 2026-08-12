@@ -2,7 +2,7 @@
 intent: tool
 stage: working
 share_target: working
-next: "Run QNAP acceptance tests, then build and recreate"
+next: "Run the 10 manual acceptance checks with a second IG account"
 blocker: null
 updated: 2026-08-12
 ---
@@ -16,8 +16,8 @@ personal Instagram connection stays reachable from Telegram without opening the 
 Updates are deliberately manual — no Watchtower, no `latest` tag, no unattended upstream merges.
 
 ## Current state
-The deployed commit (`437436f`) works but fails silently in three ways, all now addressed on
-`feat/reliability-and-replies`:
+Deployed and running as `0c11cc5` (branch `feat/reliability-and-replies`). The previous commit
+(`437436f`) worked but failed silently in three ways, all now addressed:
 
 - MQTT disconnects left the bridge at status `error` with no reconnect and no recovery of messages
   delivered during the gap. There is now a bounded reconnect loop and a bounded missed-message check.
@@ -27,16 +27,23 @@ The deployed commit (`437436f`) works but fails silently in three ways, all now 
 - Telegram replies became ordinary Instagram messages. They now become native replies when the
   bridge has a mapping, and fall back to an ordinary send when it does not.
 
-Also in this branch: disappearing media gets an explicit "Open Instagram" notice and is never
-fetched; messages sent from the Instagram app are mirrored into Telegram as "📤 You: …"; `/status`
-reports session, realtime, last check, and queue depth separately; and no message text or credential
-reaches the logs. 106 tests pass, type-check and build are clean.
+Also live: disappearing media gets an explicit "Open Instagram" notice and is never fetched;
+messages sent from the Instagram app are mirrored into Telegram as "📤 You: …"; `/status` reports
+session, realtime, last check, and queue depth separately; and no message text or credential
+reaches the logs. 106 tests pass; type-check and build are clean.
 
-**Not yet deployed.** The branch is pushed and reviewed but the QNAP still runs the old commit, and
-the manual acceptance tests need a secondary Instagram account and a person.
+The first startup on the NAS confirmed the point of the exercise: reconciliation forwarded **6
+messages that the old deployment had lost**, skipped 5 it already knew, and failed on none. The new
+log file is 15 lines of metadata where the previous one had grown to 2.2 MB containing 27 outgoing
+message bodies.
+
+Rollback is one command — `ig2tg:rollback-437436f` is tagged and the old source is at
+`/share/docker/ig2tg-source-437436f`. See `QNAP-DEPLOY.md`.
 
 ## Next
-- Back up `/share/docker/ig2tg/data` with the container stopped (WAL sidecars included).
-- Check out the branch on the QNAP, `compose build --pull=false`, `compose up -d --force-recreate`.
-- Work the acceptance checklist in `QNAP-DEPLOY.md`, especially the simulated outage and the
-  failed-send-survives-restart case.
+- Work the 10 manual acceptance checks in `QNAP-DEPLOY.md` with a second Instagram account. The
+  reply, disappearing-media, simulated-outage, and failed-send-survives-restart cases are the ones
+  automated tests cannot cover.
+- Delete the pre-fix log file, which contains outgoing message text:
+  `/share/docker/ig2tg/data/.ig2tg/logs/session-2026-08-11_10.log`.
+- Decide whether to merge the branch to `master` on the fork now that it is the deployed revision.

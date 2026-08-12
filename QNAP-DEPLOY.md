@@ -62,25 +62,78 @@ Keep `DEBUG` unset in `.env`. Setting it makes the Instagram library write full
 request and response bodies — message text and session cookies — into the log
 files on this volume.
 
+## Two things about this NAS that will trip you up
+
+**There is no `git` on the QNAP.** `/share/docker/ig2tg` is a plain file copy, not
+a checkout. The deployed revision is recorded in the `DEPLOYED_COMMIT` file, which
+you update by hand. Transfer the source with `rsync` from the reviewed clone.
+
+**The default `HOME` for this account is not writable**, so `docker compose build`
+fails with `mkdir …/container-station/homes/jvrooijen: permission denied`. Override
+`HOME` and `DOCKER_CONFIG` for build and compose commands, as shown below.
+
 ## Intentional update procedure
 
 1. Review the change and select a commit deliberately.
-2. Run the local checks in the fork: `npm run check` (type-check + test suite),
+2. Run the checks in the reviewed clone: `npm run check` (type-check + tests),
    then `npm run build`.
 3. Review the diff for message-body or credential logging.
-4. Back up `data` as above, and keep the previous checkout for rollback.
-5. Update `compose.yaml`'s immutable image tag if it is being pinned to a new
-   fork commit.
-6. On the QNAP: `git fetch && git checkout <commit>`, then manually run
-   `compose build --pull=false` and `compose up -d --force-recreate`.
-7. Inspect a bounded slice of the log: `$D logs --tail=100 ig2tg`.
-8. Verify `/status` in Telegram, then run the acceptance checks below.
+4. Back up `data` as above.
+5. Keep the current source for rollback, and tag the currently-running image so a
+   rollback does not require a rebuild:
 
-For rollback, check out the previous reviewed fork commit, restore its image tag in `compose.yaml`, and rebuild. The persistent `data` directory is retained.
+   ```sh
+   D=/share/CACHEDEV2_DATA/.qpkg/container-station/usr/bin/docker
+   S="-H unix:///var/run/docker.sock"
+   mkdir -p /share/docker/ig2tg-source-$(cat /share/docker/ig2tg/DEPLOYED_COMMIT | cut -c1-7)
+   rsync -a --exclude data/ /share/docker/ig2tg/ /share/docker/ig2tg-source-$(cat /share/docker/ig2tg/DEPLOYED_COMMIT | cut -c1-7)/
+   $D $S tag "$($D $S inspect ig2tg --format '{{.Image}}')" ig2tg:rollback-$(cat /share/docker/ig2tg/DEPLOYED_COMMIT | cut -c1-7)
+   ```
 
-Database migrations are idempotent and additive, so a rollback to the previous
-commit works against the migrated database without restoring the backup. Restore
-the backup only if the data itself is wrong.
+6. From the reviewed clone on your workstation, sync the source. `--delete` keeps
+   the NAS free of stale files; the excludes protect `.env`, the data volume, and
+   `DEPLOYED_COMMIT`:
+
+   ```sh
+   rsync -a --delete \
+     --exclude '.git' --exclude '.claude/' --exclude 'node_modules' \
+     --exclude 'dist/' --exclude 'data/' --exclude '.env' --exclude 'DEPLOYED_COMMIT' \
+     -e 'ssh -p 12344' ./ jvrooijen@qnap:/share/docker/ig2tg/
+   ```
+
+7. Build. This does not touch the running container — it keeps running from the
+   image it started with, by ID, even though the tag now points elsewhere:
+
+   ```sh
+   cd /share/docker/ig2tg
+   export HOME=/share/docker/ig2tg/.buildhome
+   export DOCKER_CONFIG=$HOME/.docker
+   $D $S compose build --pull=false
+   ```
+
+8. Recreate, then record the new revision:
+
+   ```sh
+   $D $S compose up -d --force-recreate
+   printf '%s\n' "<full-commit-sha>" > /share/docker/ig2tg/DEPLOYED_COMMIT
+   ```
+
+9. Inspect a bounded slice of the log: `$D $S logs --tail=100 ig2tg`. A healthy
+   start logs the migrations, `Auto-logged in as @…`, `Bridge is running`, and a
+   `Reconciliation complete: …` line.
+10. Verify `/status` in Telegram, then run the acceptance checks below.
+
+### Rollback
+
+```sh
+$D $S tag ig2tg:rollback-<short-sha> ig2tg:manual-pinned
+rsync -a /share/docker/ig2tg-source-<short-sha>/ /share/docker/ig2tg/
+$D $S compose up -d --force-recreate
+```
+
+Database migrations are additive and idempotent, so the old code runs against the
+migrated database without restoring the backup — the extra columns and tables are
+simply ignored. Restore the data backup only if the data itself is wrong.
 
 ## Post-deployment acceptance checks
 

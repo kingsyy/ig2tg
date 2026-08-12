@@ -44,5 +44,12 @@ cookies — into the log file on the persistent volume. It is now strictly opt-i
 `bridge/logger.ts` wrote `debug` lines to that file regardless of the configured log level. The
 30-character text preview named in the handoff was the smallest of the three leaks.
 
-**Next:** Manual acceptance tests on the QNAP against a secondary Instagram account (checklist in
-`QNAP-DEPLOY.md`), then build and recreate the container.
+**Deployed** as `0c11cc5`. Migrations were rehearsed against a copy of the live database before the
+recreate (113 messages, 1 thread, all preserved, idempotent over two runs). First startup forwarded 6
+messages the old deployment had lost. The QNAP has no `git` — `/share/docker/ig2tg` is an rsync
+target with a `DEPLOYED_COMMIT` file — and its default `HOME` is unwritable, so `compose build` needs
+`HOME` and `DOCKER_CONFIG` overridden; both are now written down in `QNAP-DEPLOY.md`.
+
+**Next:** The 10 manual acceptance checks in `QNAP-DEPLOY.md`, which need a second Instagram account.
+Delete `data/.ig2tg/logs/session-2026-08-11_10.log` — it predates the logging fix and contains
+outgoing message text.
