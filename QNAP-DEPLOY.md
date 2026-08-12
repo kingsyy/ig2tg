@@ -106,8 +106,11 @@ fails with `mkdir …/container-station/homes/jvrooijen: permission denied`. Ove
 
    ```sh
    cd /share/docker/ig2tg
-   export HOME=/share/docker/ig2tg/.buildhome
+   # Deliberately outside the deployment directory: the rsync in step 6 uses
+   # --delete and would wipe buildx state kept inside it.
+   export HOME=/share/docker/.ig2tg-buildhome
    export DOCKER_CONFIG=$HOME/.docker
+   mkdir -p "$DOCKER_CONFIG"
    $D $S compose build --pull=false
    ```
 
