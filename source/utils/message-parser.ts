@@ -280,6 +280,42 @@ function extractReelLink(item: any): string | null {
 	return null;
 }
 
+/**
+ * The only thing the bridge ever says about disappearing (one-time / "raven")
+ * media. It is deliberately a notice and not the media: the bridge must never
+ * download, forward, proxy, or mark such media as viewed, and must never log
+ * its URL.
+ */
+export const DISAPPEARING_MEDIA_NOTICE =
+	'📷 You received a disappearing photo or video. Open Instagram to view it.';
+
+/**
+ * Recognizes disappearing media across the payload shapes Instagram uses.
+ *
+ * `raven_media` is the MQTT item type, but the REST thread feed and some newer
+ * payloads instead carry a `visual_media` envelope, sometimes under an item type
+ * that would otherwise be treated as ordinary downloadable media. Detecting the
+ * envelope as well as the item type keeps a missed variant from being handled by
+ * the generic media path.
+ */
+function isDisappearingMedia(item: unknown): boolean {
+	const candidate = item as {
+		item_type?: string;
+		visual_media?: unknown;
+		raven_media?: unknown;
+	} | null;
+	if (!candidate || typeof candidate !== 'object') return false;
+
+	if (
+		candidate.item_type === MessageSyncMessageTypes.RavenMedia ||
+		candidate.item_type === 'visual_media'
+	) {
+		return true;
+	}
+
+	return candidate.visual_media !== undefined || candidate.raven_media !== undefined;
+}
+
 export function parseMessageItem(
 	item: RealChatItem,
 	threadId: string,
@@ -329,6 +365,16 @@ export function parseMessageItem(
 
 		client_context: (item as any).client_context,
 	};
+
+	// Checked before the item-type switch so a disappearing-media variant can
+	// never fall through to the downloadable-media path below.
+	if (isDisappearingMedia(item)) {
+		return {
+			...baseMessage,
+			itemType: 'placeholder',
+			text: DISAPPEARING_MEDIA_NOTICE,
+		};
+	}
 
 	switch (item.item_type) {
 		case MessageSyncMessageTypes.Text: {
@@ -439,14 +485,6 @@ export function parseMessageItem(
 				...baseMessage,
 				itemType: 'media_share',
 				mediaSharePost: post,
-			};
-		}
-
-		case MessageSyncMessageTypes.RavenMedia: {
-			return {
-				...baseMessage,
-				itemType: 'placeholder',
-				text: '[Disappearing message]',
 			};
 		}
 

@@ -141,9 +141,10 @@ Type these in the supergroup's **General** topic:
 | `/login user pass` | Connect Instagram (message auto-deleted) |
 | `/2fa <code>` | Complete two-factor authentication (message auto-deleted) |
 | `/logout` | Disconnect Instagram and reset the bridge |
-| `/status` | Bridge health, connection state, message count |
-| `/reconnect` | Force-reconnect Instagram MQTT |
-| `/sync` | Backfill recent threads |
+| `/status` | Application, session, and realtime state; last message check; pending and failed outgoing counts |
+| `/reconnect` | Reconnect Instagram realtime now |
+| `/sync` | Check recent threads for messages that never reached Telegram, and forward them |
+| `/retry` | Reply to a failed outgoing message (or its failure notice) to resend it |
 | `/mute @user` | Stop forwarding from a contact |
 | `/unmute @user` | Resume forwarding |
 | `/contacts` | List all bridged contacts |
@@ -157,11 +158,38 @@ The Instagram client layer is derived from [instagram-cli](https://github.com/su
 
 See [docs/k3s-deployment.md](docs/k3s-deployment.md) for a step-by-step guide to running ig2tg on a k3s cluster.
 
+## Reliability behaviour
+
+- **Realtime disconnects reconnect automatically**, with bounded exponential
+  backoff (5s → 5min, then holding at the cap). The bridge owns reconnection, so
+  every reconnect re-subscribes and then checks for messages missed during the gap.
+- **Connection loss is visible in Telegram.** One warning per outage, once the
+  connection has been down long enough to matter — not one per MQTT error.
+- **Outgoing messages are persisted before they are sent.** A failed send stays
+  visible and retryable across container restarts; `/retry` resends it. Success is
+  never reported before Instagram accepts the message.
+- **Disappearing media is announced, never fetched.** One-time photos and videos
+  produce an "Open Instagram to view it" notice; the bridge never downloads,
+  forwards, or marks them as viewed.
+- **Messages you send from the Instagram app are mirrored** into Telegram as
+  "📤 You: …". Set `BRIDGE_FORWARD_OWN_MESSAGES=false` to turn this off.
+- **Operational logs carry no message content** — no text, captions, media URLs,
+  or queue payloads, and no credentials or session cookies.
+
 ## Known Limitations
 
 - **Personal accounts only** — uses Instagram's private API, not the official Graph API
 - **Instagram may flag logins** — occasional challenges or session expiry may require re-authentication
 - **Voice note conversion** — may require `ffmpeg` installed (Telegram uses OGG Opus, Instagram uses AAC)
+- **Reconciliation is bounded** — it inspects the most recent threads and messages
+  (10 × 30 by default), not the full history. A gap longer than that window is not
+  recovered.
+- **Delivery is at-least-once, not exactly-once** — the stable `client_context`
+  lets Instagram discard an obvious duplicate, but that is a best-effort property
+  of a private API, not a guarantee.
+- **Native replies need a mapping** — a reply to a message the bridge forwarded
+  before this change (or one it never saw) is sent as an ordinary message rather
+  than being refused.
 - **No end-to-end encryption** — messages pass through your server in plaintext
 - **Group DMs** — supported but experimental, messages are prefixed with sender names
 - **No TG→IG replies or reactions** — message IDs are stored as SHA-256 hashes for privacy, so the bridge cannot map a Telegram message back to its Instagram original. Replying to a message in Telegram sends a new message (not a quote-reply) on Instagram. Reactions added in Telegram are not forwarded to Instagram. The reverse direction (IG→TG) works normally for both replies and reactions.

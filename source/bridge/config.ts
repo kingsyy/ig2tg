@@ -66,6 +66,26 @@ const BridgeConfigSchema = z.object({
 		backfill_count: z.number().default(20),
 		topic_name_format: z.string().default('@{username}'),
 		log_level: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+
+		/** Threads inspected by a reconciliation pass, most recently active first. */
+		reconcile_thread_count: z.number().default(10),
+		/** Recent messages inspected per thread during reconciliation. */
+		reconcile_message_count: z.number().default(30),
+		/**
+		 * Forward messages you sent from the Instagram app into Telegram, prefixed
+		 * with "📤 You". Echoes of the bridge's own sends are filtered out by
+		 * client_context, so this does not duplicate what you sent from Telegram.
+		 */
+		forward_own_messages: z.boolean().default(true),
+		/**
+		 * How long realtime must stay down before Telegram is warned. Absorbs the
+		 * brief MQTT blips that reconnect on their own.
+		 */
+		disconnect_warn_after_seconds: z.number().default(45),
+		/** Bounded automatic attempts per outgoing message before it is left failed. */
+		outbound_max_attempts: z.number().default(4),
+		/** How long delivered outbound records are kept before pruning. */
+		outbound_retention_days: z.number().default(7),
 	}),
 });
 

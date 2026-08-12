@@ -5,6 +5,7 @@ import process from 'node:process';
 import nodeUtil from 'node:util';
 import debugModule from 'debug';
 import {ConfigManager} from '../config.js';
+import {describeError} from './redact.js';
 
 type LogLevel = 'error' | 'warn' | 'info' | 'debug';
 
@@ -153,14 +154,13 @@ class Logger {
 				);
 			};
 
-			// Enable debug output for instagram API if DEBUG env var is set
-			// Or enable it by default for better logging coverage
+			// Only enable namespaces the operator asked for. `ig:*` was previously
+			// enabled by default, which wrote every Instagram request and response —
+			// message bodies, media URLs, and session cookies — into the log file on
+			// the persistent volume. It is now strictly opt-in via DEBUG.
 			const debugEnv = process.env['DEBUG'];
 			if (debugEnv) {
 				debugModule.enable(debugEnv);
-			} else {
-				// Enable all ig:* namespaces by default for comprehensive API logging
-				debugModule.enable('ig:*');
 			}
 
 			this.debugHookInstalled = true;
@@ -241,8 +241,20 @@ export async function initializeLogger(): Promise<void> {
 export function createContextualLogger(context: string) {
 	const logger = getLogger();
 	return {
+		/**
+		 * The error is reduced to a sanitized description before it reaches the log
+		 * file, and its stack is dropped.
+		 *
+		 * Instagram errors put the whole HTTP response body in `error.message` —
+		 * which, for a direct-message request, is the message text — and the first
+		 * line of `error.stack` repeats it. Only the class name, status code, and a
+		 * short secret-scrubbed detail are kept.
+		 */
 		error(message: string, error?: Error | unknown) {
-			logger.error(message, context, error);
+			logger.error(
+				error === undefined ? message : `${message}: ${describeError(error)}`,
+				context,
+			);
 		},
 		warn(message: string) {
 			logger.warn(message, context);

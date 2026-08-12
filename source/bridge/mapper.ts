@@ -5,9 +5,11 @@ import type {BridgeConfig} from './config.js';
 import {
 	getThreadByIgId,
 	createThreadMapping,
+	logTag,
 	type ThreadMapping,
 } from './db.js';
 import {createLogger} from './logger.js';
+import {describeError, logFields} from '../utils/redact.js';
 
 const logger = createLogger('mapper');
 
@@ -54,7 +56,14 @@ export async function ensureTopicForThread(
 		? `👥 ${groupTitle}`
 		: formatTopicName(config.bridge.topic_name_format, username, fullName);
 
-	logger.info(`Creating topic for ${isGroup ? `group "${groupTitle}"` : `@${username}`}: "${topicName}"`);
+	// Logs identify the thread by hash: a contact's username is as identifying as
+	// the conversation itself.
+	logger.info(
+		`Creating topic: ${logFields({
+			thread_hash: logTag(threadId),
+			is_group: isGroup,
+		})}`,
+	);
 
 	let topic: Awaited<ReturnType<typeof bot.api.createForumTopic>>;
 
@@ -68,12 +77,25 @@ export async function ensureTopicForThread(
 		} catch (error) {
 			if (error instanceof GrammyError && error.error_code === 429) {
 				const retryAfter = (error.parameters as any)?.retry_after ?? 30;
-				logger.warn(`Rate-limited creating topic for @${username}, retrying in ${retryAfter}s (attempt ${attempt}/${MAX_RETRIES})`);
+				logger.warn(
+					`Rate-limited creating topic, retrying in ${retryAfter}s (attempt ${attempt}/${MAX_RETRIES}): ${logFields({thread_hash: logTag(threadId)})}`,
+				);
 				if (attempt < MAX_RETRIES) {
 					await sleep(retryAfter * 1000);
 					continue;
 				}
 			}
+
+			// Anything else — a permission error in particular — is propagated. The
+			// caller leaves the message unlogged so reconciliation can retry it once
+			// the Telegram permission is fixed.
+			logger.error(
+				`Topic creation failed: ${logFields({
+					thread_hash: logTag(threadId),
+					attempt,
+					error_class: describeError(error),
+				})}`,
+			);
 			throw error;
 		}
 	}
@@ -90,6 +112,11 @@ export async function ensureTopicForThread(
 		is_group: isGroup ? 1 : 0,
 	});
 
-	logger.info(`Mapped IG thread ${threadId} → TG topic ${topic.message_thread_id}`);
+	logger.info(
+		`Mapped IG thread → TG topic: ${logFields({
+			thread_hash: logTag(threadId),
+			topic_id: topic.message_thread_id,
+		})}`,
+	);
 	return mapping;
 }

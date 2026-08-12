@@ -9,4 +9,21 @@ bridge:
   backfill_on_start: "${env:BRIDGE_BACKFILL_ON_START:-true}"
   backfill_count: "${env:BRIDGE_BACKFILL_COUNT:-20}"
   topic_name_format: "${env:BRIDGE_TOPIC_NAME_FORMAT:-@{username}}"
-  log_level: "${env:BRIDGE_LOG_LEVEL:-debug}"
+  # Keep this at info in production: debug output is written to the log file on
+  # the persistent volume, and debug lines carry more metadata than info lines.
+  log_level: "${env:BRIDGE_LOG_LEVEL:-info}"
+
+  # Reliability
+  # Threads and messages inspected by a missed-message check (after a reconnect,
+  # on startup, and on /sync). Raising these means more Instagram REST calls.
+  reconcile_thread_count: "${env:BRIDGE_RECONCILE_THREAD_COUNT:-10}"
+  reconcile_message_count: "${env:BRIDGE_RECONCILE_MESSAGE_COUNT:-30}"
+  # How long realtime must stay down before Telegram is warned.
+  disconnect_warn_after_seconds: "${env:BRIDGE_DISCONNECT_WARN_AFTER_SECONDS:-45}"
+  # Bounded automatic attempts per outgoing message before it is left failed.
+  outbound_max_attempts: "${env:BRIDGE_OUTBOUND_MAX_ATTEMPTS:-4}"
+  outbound_retention_days: "${env:BRIDGE_OUTBOUND_RETENTION_DAYS:-7}"
+
+  # Mirror the messages you send from the Instagram app into Telegram, prefixed
+  # with "📤 You". Echoes of the bridge's own sends are filtered out.
+  forward_own_messages: "${env:BRIDGE_FORWARD_OWN_MESSAGES:-true}"

@@ -1,5 +1,6 @@
 import {extname} from 'node:path';
 import fs from 'node:fs';
+import {randomUUID} from 'node:crypto';
 import {EventEmitter} from 'node:events';
 import {Readable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
@@ -14,10 +15,9 @@ import {
 	type AccountRepositoryLoginErrorResponseTwoFactorInfo,
 } from 'instagram-private-api';
 import {
-	withRealtime,
 	GraphQLSubscriptions,
 	SkywalkerSubscriptions,
-	type RealtimeClient,
+	RealtimeClient,
 	IgApiClientExt,
 } from 'instagram_mqtt';
 import {SessionManager} from './session.js';
@@ -34,6 +34,7 @@ import {
 	getBestMediaUrl,
 } from './utils/message-parser.js';
 import {createContextualLogger} from './utils/logger.js';
+import {describeError} from './utils/redact.js';
 
 export type LoginResult = {
 	success: boolean;
@@ -48,13 +49,54 @@ export type RealtimeStatus =
 	| 'disconnected'
 	| 'connecting'
 	| 'connected'
+	| 'reconnecting'
 	| 'error';
+
+export type SendMessageOptions = {
+	/** Instagram item ID this message replies to, producing a native IG reply. */
+	replyToItemId?: string;
+	/** The replied-to item's client_context, when the bridge recorded one. */
+	replyToClientContext?: string;
+	/**
+	 * A stable idempotency token reused across retries. Instagram treats a repeat
+	 * of the same client_context as the same send, which is what keeps a retry
+	 * after a mid-flight crash from producing a duplicate message.
+	 */
+	clientContext?: string;
+};
+
+/**
+ * Application-owned reconnect schedule. Delays climb and then hold at the cap,
+ * so a long Instagram outage keeps being retried without hammering the API.
+ */
+export const RECONNECT_DELAYS_MS = [5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
+
+/** ±20% jitter so repeated failures don't retry in lockstep. */
+function withJitter(delayMs: number): number {
+	const spread = delayMs * 0.2;
+	return Math.round(delayMs - spread + Math.random() * spread * 2);
+}
+
+/**
+ * The delay before reconnect attempt number `attempt` (0-based), jitter included.
+ * Attempts past the end of the schedule hold at the cap and keep retrying.
+ */
+export function nextReconnectDelayMs(attempt: number): number {
+	const index = Math.min(Math.max(0, attempt), RECONNECT_DELAYS_MS.length - 1);
+	return withJitter(RECONNECT_DELAYS_MS[index]!);
+}
 
 // eslint-disable-next-line unicorn/prefer-event-target
 export class InstagramClient extends EventEmitter {
 	private readonly ig: IgApiClientExt;
 	private realtime: RealtimeClient | undefined;
 	private realtimeStatus: RealtimeStatus = 'disconnected';
+
+	private reconnectAttempt = 0;
+	private reconnectInFlight = false;
+	private reconnectTimer: NodeJS.Timeout | undefined = undefined;
+	private shuttingDown = false;
+	private lastRealtimeEventAt: Date | undefined = undefined;
 
 	private sessionManager: SessionManager | undefined = undefined;
 	private readonly configManager: ConfigManager;
@@ -124,9 +166,11 @@ export class InstagramClient extends EventEmitter {
 					this.emit(
 						'error',
 						new Error(
-							`Realtime connection failed: ${(error as Error).message}`,
+							`Realtime connection failed: ${(error as Error).name}`,
 						),
 					);
+					// Authentication succeeded, so keep retrying the MQTT connection.
+					this.scheduleReconnect();
 				}
 			}
 
@@ -155,7 +199,7 @@ export class InstagramClient extends EventEmitter {
 			this.logger.error('Login failed', error);
 			return {
 				success: false,
-				error: error instanceof Error ? error.message : 'Unknown login error',
+				error: describeError(error),
 			};
 		}
 	}
@@ -198,7 +242,7 @@ export class InstagramClient extends EventEmitter {
 			this.logger.error('2FA Login failed', error);
 			return {
 				success: false,
-				error: error instanceof Error ? error.message : 'Unknown 2FA error',
+				error: describeError(error),
 			};
 		}
 	}
@@ -244,9 +288,11 @@ export class InstagramClient extends EventEmitter {
 					this.emit(
 						'error',
 						new Error(
-							`Realtime connection failed: ${(error as Error).message}`,
+							`Realtime connection failed: ${(error as Error).name}`,
 						),
 					);
+					// Authentication succeeded, so keep retrying the MQTT connection.
+					this.scheduleReconnect();
 				}
 			}
 
@@ -264,14 +310,43 @@ export class InstagramClient extends EventEmitter {
 			this.logger.error('Failed to login with session', error);
 			return {
 				success: false,
-				error: error instanceof Error ? error.message : 'Unknown session error',
+				error: describeError(error),
 			};
 		}
 	}
 
 	public async shutdown(): Promise<void> {
-		if (this.realtime) {
-			await this.realtime.disconnect();
+		this.shuttingDown = true;
+		this.cancelScheduledReconnect();
+		await this.teardownRealtime();
+		this.setRealtimeStatus('disconnected');
+	}
+
+	/**
+	 * Reconnects Instagram realtime now, restoring the existing authenticated
+	 * session rather than logging in again. Safe to call while a scheduled
+	 * reconnect is pending — it cancels it and takes over.
+	 */
+	public async reconnectRealtime(): Promise<'connected' | 'in_progress' | 'failed'> {
+		if (this.reconnectInFlight) return 'in_progress';
+
+		this.shuttingDown = false;
+		this.cancelScheduledReconnect();
+		this.reconnectAttempt = 0;
+		return (await this.attemptReconnect()) ? 'connected' : 'failed';
+	}
+
+	/**
+	 * Verifies the REST session is still authenticated. One lightweight request;
+	 * callers must not poll it.
+	 */
+	public async checkSession(): Promise<boolean> {
+		try {
+			await this.ig.account.currentUser();
+			return true;
+		} catch (error) {
+			this.logger.error('Instagram session check failed', error);
+			return false;
 		}
 	}
 
@@ -289,6 +364,14 @@ export class InstagramClient extends EventEmitter {
 
 	public getRealtimeStatus(): RealtimeStatus {
 		return this.realtimeStatus;
+	}
+
+	public getLastRealtimeEventAt(): Date | undefined {
+		return this.lastRealtimeEventAt;
+	}
+
+	public getReconnectAttempt(): number {
+		return this.reconnectAttempt;
 	}
 
 	public getUserCache(): Map<string, string> {
@@ -381,17 +464,76 @@ export class InstagramClient extends EventEmitter {
 		}
 	}
 
-	public async sendMessage(threadId: string, text: string, replyToItemId?: string): Promise<string> {
+	/**
+	 * Fetches a bounded window of the most recent messages in a thread, returned
+	 * oldest-first. One REST request per call — used by reconciliation, which
+	 * paces its calls so a reconnect cannot turn into aggressive polling.
+	 */
+	public async getRecentMessages(
+		threadId: string,
+		limit: number,
+	): Promise<Message[]> {
+		const {messages} = await this.getMessages(threadId);
+		return limit > 0 && messages.length > limit ? messages.slice(-limit) : messages;
+	}
+
+	/**
+	 * Sends a text message, optionally as a native Instagram reply.
+	 *
+	 * This goes through the `directThread` repository rather than
+	 * `entity.directThread().broadcastText()` so the bridge can supply its own
+	 * `client_context` for idempotent retries. The trade-off is that a message
+	 * containing a URL is sent as plain text instead of being converted into a
+	 * link item; Instagram still renders the URL as a tappable link.
+	 */
+	public async sendMessage(
+		threadId: string,
+		text: string,
+		options: SendMessageOptions = {},
+	): Promise<string> {
+		const clientContext = options.clientContext ?? randomUUID();
+
+		const form: Record<string, string> = {
+			text,
+			client_context: clientContext,
+			mutation_token: clientContext,
+		};
+
+		if (options.replyToItemId) {
+			form['replied_to_action_source'] = 'swipe';
+			form['replied_to_item_id'] = options.replyToItemId;
+			if (options.replyToClientContext) {
+				form['replied_to_client_context'] = options.replyToClientContext;
+			}
+		}
+
 		try {
-			const replyTo = replyToItemId
-				? {item_id: replyToItemId, client_context: replyToItemId} as any
-				: undefined;
-			const res = await this.ig.entity.directThread(threadId).broadcastText(text, replyTo);
-			return 'payload' in res ? res.payload.item_id : res.item_id;
+			const res = await this.ig.directThread.broadcast({
+				item: 'text',
+				threadIds: [threadId],
+				form,
+			});
+			return this.extractItemId(res);
 		} catch (error) {
-			this.logger.error('Failed to send message', error);
+			// The raw error carries the request form, which contains the message
+			// text — only the class name and status are safe to record here.
+			this.logger.error(
+				`Failed to send message (${(error as Error)?.name ?? 'unknown'})`,
+			);
 			throw error;
 		}
+	}
+
+	private extractItemId(res: unknown): string {
+		const body = res as
+			| {payload?: {item_id?: string}; item_id?: string}
+			| undefined;
+		const itemId = body?.payload?.item_id ?? body?.item_id;
+		if (!itemId) {
+			throw new Error('Instagram accepted the send but returned no item ID');
+		}
+
+		return itemId;
 	}
 
 	public async sendPhoto(threadId: string, photoBuffer: Buffer): Promise<string> {
@@ -399,9 +541,9 @@ export class InstagramClient extends EventEmitter {
 			const res = await this.ig.entity.directThread(threadId).broadcastPhoto({
 				file: photoBuffer,
 			});
-			return 'payload' in res ? res.payload.item_id : res.item_id;
+			return this.extractItemId(res);
 		} catch (error) {
-			this.logger.error('Failed to send photo', error);
+			this.logger.error(`Failed to send photo (${(error as Error)?.name ?? 'unknown'})`);
 			throw error;
 		}
 	}
@@ -411,9 +553,9 @@ export class InstagramClient extends EventEmitter {
 			const res = await this.ig.entity.directThread(threadId).broadcastVideo({
 				video: videoBuffer,
 			});
-			return 'payload' in res ? res.payload.item_id : res.item_id;
+			return this.extractItemId(res);
 		} catch (error) {
-			this.logger.error('Failed to send video', error);
+			this.logger.error(`Failed to send video (${(error as Error)?.name ?? 'unknown'})`);
 			throw error;
 		}
 	}
@@ -423,9 +565,9 @@ export class InstagramClient extends EventEmitter {
 			const res = await this.ig.entity.directThread(threadId).broadcastVoice({
 				file: voiceBuffer,
 			});
-			return 'payload' in res ? res.payload.item_id : res.item_id;
+			return this.extractItemId(res);
 		} catch (error) {
-			this.logger.error('Failed to send voice', error);
+			this.logger.error(`Failed to send voice (${(error as Error)?.name ?? 'unknown'})`);
 			throw error;
 		}
 	}
@@ -489,22 +631,118 @@ export class InstagramClient extends EventEmitter {
 		this.emit('realtimeStatus', status);
 	}
 
+	private cancelScheduledReconnect(): void {
+		if (this.reconnectTimer) {
+			clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = undefined;
+		}
+	}
+
+	/**
+	 * Detaches and disconnects the current realtime client. Listeners are removed
+	 * first so a dying connection cannot schedule another reconnect on the way out.
+	 */
+	private async teardownRealtime(): Promise<void> {
+		const previous = this.realtime;
+		this.realtime = undefined;
+		if (!previous) return;
+
+		previous.removeAllListeners();
+		try {
+			await previous.disconnect();
+		} catch {
+			// Already gone — nothing to clean up.
+		}
+	}
+
+	/**
+	 * Queues the next reconnect attempt. Concurrent attempts are suppressed: at
+	 * most one timer and one in-flight attempt exist at a time.
+	 */
+	private scheduleReconnect(): void {
+		if (this.shuttingDown || this.reconnectInFlight || this.reconnectTimer) return;
+
+		const delay = nextReconnectDelayMs(this.reconnectAttempt);
+
+		this.setRealtimeStatus('reconnecting');
+		this.logger.info(
+			`Scheduling Instagram realtime reconnect in ${Math.round(delay / 1000)}s (attempt ${this.reconnectAttempt + 1})`,
+		);
+
+		this.reconnectTimer = setTimeout(() => {
+			this.reconnectTimer = undefined;
+			void this.attemptReconnect();
+		}, delay);
+		this.reconnectTimer.unref?.();
+	}
+
+	/**
+	 * Rebuilds the MQTT connection on top of the existing authenticated session.
+	 * Never re-logs in: repeated full logins are what trigger Instagram challenges.
+	 */
+	private async attemptReconnect(): Promise<boolean> {
+		if (this.reconnectInFlight || this.shuttingDown) return false;
+		this.reconnectInFlight = true;
+
+		try {
+			await this.teardownRealtime();
+			await this.initializeRealtime();
+			this.reconnectAttempt = 0;
+			this.logger.info('Instagram realtime reconnected');
+			this.emit('realtimeReconnected');
+			return true;
+		} catch (error) {
+			this.reconnectAttempt++;
+			this.logger.error(
+				`Instagram realtime reconnect failed (attempt ${this.reconnectAttempt}, ${(error as Error)?.name ?? 'unknown'})`,
+			);
+			this.reconnectInFlight = false;
+			this.scheduleReconnect();
+			return false;
+		} finally {
+			this.reconnectInFlight = false;
+		}
+	}
+
+	/**
+	 * Called when the connection drops. The status change is emitted once per
+	 * transition, so a burst of low-level MQTT errors does not produce a burst of
+	 * notifications downstream.
+	 */
+	private handleRealtimeLoss(status: 'error' | 'disconnected'): void {
+		if (this.shuttingDown) return;
+		if (this.realtimeStatus === 'reconnecting' || this.reconnectInFlight) return;
+
+		this.setRealtimeStatus(status);
+		this.scheduleReconnect();
+	}
+
 	private async initializeRealtime(): Promise<void> {
 		this.setRealtimeStatus('connecting');
-		this.realtime = withRealtime(this.ig).realtime;
+		this.realtime = new RealtimeClient(this.ig);
+		const realtime = this.realtime;
 
-		this.realtime.on('error', error => {
-			this.logger.error('Realtime Error', error);
-			this.setRealtimeStatus('error');
+		realtime.on('error', (error: Error) => {
+			this.logger.error(`Realtime error (${error?.name ?? 'unknown'})`);
 			this.emit('error', error);
+			this.handleRealtimeLoss('error');
 		});
 
-		this.realtime.on('close', () => {
-			this.setRealtimeStatus('disconnected');
+		realtime.on('close', () => {
+			this.handleRealtimeLoss('disconnected');
 		});
 
-		this.realtime.on('message', (wrapper: any) => {
-			this.logger.debug(`Received MQTT "message": ${JSON.stringify(wrapper)}`);
+		realtime.on('disconnect', () => {
+			this.handleRealtimeLoss('disconnected');
+		});
+
+		realtime.on('message', (wrapper: any) => {
+			this.lastRealtimeEventAt = new Date();
+			// Deliberately does NOT log the payload: an MQTT message wrapper contains
+			// the full message text and media URLs.
+			this.logger.debug(
+				`MQTT event delta_type=${wrapper?.delta_type ?? 'unknown'} item_type=${wrapper?.message?.item_type ?? 'none'}`,
+			);
 
 			if (
 				wrapper.delta_type === 'deltaCreateReaction' &&
@@ -539,7 +777,7 @@ export class InstagramClient extends EventEmitter {
 			}
 		});
 
-		await this.realtime.connect({
+		await realtime.connect({
 			graphQlSubs: [
 				GraphQLSubscriptions.getAppPresenceSubscription(),
 				GraphQLSubscriptions.getZeroProvisionSubscription(
@@ -556,6 +794,9 @@ export class InstagramClient extends EventEmitter {
 				SkywalkerSubscriptions.liveSub(this.ig.state.cookieUserId),
 			],
 			irisData: await this.ig.feed.directInbox().request(),
+			// The bridge owns reconnection so that every reconnect also re-subscribes
+			// with fresh iris data and triggers missed-message reconciliation.
+			autoReconnect: false,
 		});
 
 		this.setRealtimeStatus('connected');

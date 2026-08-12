@@ -16,9 +16,14 @@ export function createLogger(context: string) {
 	}
 
 	return {
-		error(message: string, error?: Error | unknown) {
-			console.error(stamp('ERROR', message), error ?? '');
-			file.error(message, error);
+		/**
+		 * Raw error objects are deliberately not forwarded. An Instagram or grammY
+		 * error carries the HTTP request/response body, which for a direct message
+		 * includes its text. Callers pass a sanitized string (see `describeError`).
+		 */
+		error(message: string) {
+			console.error(stamp('ERROR', message));
+			file.error(message);
 		},
 		warn(message: string) {
 			if (minLevel <= LOG_LEVELS.warn) {
@@ -32,10 +37,14 @@ export function createLogger(context: string) {
 			}
 			file.info(message);
 		},
+		/**
+		 * Debug output is dropped entirely below the configured level rather than
+		 * only being hidden from the console — otherwise it still reaches the log
+		 * file on the persistent volume.
+		 */
 		debug(message: string) {
-			if (minLevel <= LOG_LEVELS.debug) {
-				console.log(stamp('DEBUG', message));
-			}
+			if (minLevel > LOG_LEVELS.debug) return;
+			console.log(stamp('DEBUG', message));
 			file.debug(message);
 		},
 	};
